@@ -48,6 +48,21 @@
                 03 Jan 2017 - Add new string compare function to ignore case-sensitive strings,
                             fix to link_status vfconfig param
 				31 Jan 2017 - ensure that the *cast settings are restored after vlan and vlanmac callbacks.
+				11 Feb 2017 - Set drop enable bit on VF's queues only between reset and queue ready. Setting
+							on constantly causes packet loss on the NIC.  Change the hardware CRC strip
+							setting to true. Add ability to turn off hardware crc stripping via the main
+							parm file.
+				23 Feb 2017 - Allow multiple VLAN IDs with strip == true.
+				24 Feb 2017 - Corrected bug causing signal triggered termination when running attached
+							to the tty and the window is resized.
+				16 May 2017 - To switch -F flag meaning: now means enable flow control rather than disable.
+							Flow control can also be enabled in the parm file.
+				22 May 2017 - Now set the first MAC in the list as the 'default' and the rest as members of
+							the white list.  The same checks for the total number of MACs still apply.
+				23 May 2017 - Made log messages during config update consistant.
+				24 May 2017 - If the guest pushes a MAC, that will be saved and used as the default rather
+							than the first in the list.
+				26 May 2017 - Allow promisc mode on PF to be optionally disabled via main config file.
 */
 
 
@@ -337,6 +352,20 @@ int valid_vlan( int port, int vfid, int vlan ) {
 }
 
 /*
+	Looks up the loopback flag for the indicated port and returns 1 if it is set; 0 
+	otherwise.
+*/
+int suss_loopback( int port ) {
+	struct sriov_port_s *p;
+
+	if( (p = suss_port( port )) != NULL ) {
+		return !!(p->flags & PF_LOOPBACK);
+	}
+
+	return 0;
+}
+
+/*
 	Return true if the mtu value is valid for the port given.
 */
 int valid_mtu( int port, int mtu ) {
@@ -356,6 +385,24 @@ int valid_mtu( int port, int mtu ) {
 	return 0;
 }
 
+/*
+	Pushes the mac string onto the head of the list for the given port/vf combination. Sets
+	the first mac index to be 0 so that it is used if a port/vf reset is triggered.
+	Mac is a nil terminated ascii string of the form xx:xx:xx:xx:xx:xx.
+*/
+extern void push_mac( int port, int vfid, char* mac ) {
+	struct vf_s* vf;
+	
+	if( (vf = suss_vf( port, vfid )) == NULL ) {
+		bleat_printf( 2, "push_mac: vf doesn't map: %d/%d", port, vfid );
+		return;
+	}
+
+	vf->first_mac = 0;
+	strcpy( vf->macs[0], mac );			// make our copy
+
+	bleat_printf( 1, "default mac pushed onto head of list: %s", vf->macs[0] );
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 /*
@@ -524,8 +571,20 @@ char*  gen_stats( sriov_conf_t* conf, int pf_only, int pf ) {
 		return NULL;
 	}
 
-	rbidx = snprintf( rbuf, BUF_SIZE, "%s %14s %10s %10s %10s %10s %10s %10s %10s %10s %10s %10s\n",
-			"\nPF/VF  ID    PCIID", "Link", "Speed", "Duplex", "RX pkts", "RX bytes", "RX errors", "RX dropped", "TX pkts", "TX bytes", "TX errors", "Spoofed");
+	rbidx = snprintf( rbuf, BUF_SIZE, "%s %6s  %6s %6s %15s %15s %15s %15s %15s %15s %15s %15s\n",
+			"\nPF/VF  ID           PCIID",
+			 "Link",
+			 "Speed",
+			 "Duplex",
+			 "RX pkts",
+			 "RX bytes",
+			 "RX errors",
+			 "RX dropped",
+			 "TX pkts",
+			 "TX bytes",
+			 "TX errors",
+			 "Spoofed"
+		);
 	
 	for( i = 0; i < conf->num_ports; ++i ) {
 		if( pf > 0 && i != pf ) {					// if specific pf requested, do only that one
@@ -612,11 +671,16 @@ cmp_vfs (const void * a, const void * b)
 }
 
 /*
-	Set up the insert and strip charastics on the NIC. The interface should ensure that
-	the right parameter combinations are set and reject an add request if not, but
-	we are a bit parinoid and will help to enforce things here too.  If one VLAN is in
-	the list, then we allow strip_stag to control what we do. If multiple VLANs are in
-	the list, then we don't strip nor insert.
+	2017/03/23 - We now allow strip/insert when there are multiple VLAN IDs:
+		If strip == true and one ID is supplied, that ID will stripped on Rx and 
+		inserted on Tx.
+
+		If strip == true and more than one ID supplied, the outer (s) tag will be
+		stripped on Rx, and the ID from the packet descriptor will be inserted on Tx.
+	
+		IF strip == false, no stripping will take place, and insertion will be based
+		on the packet descriptor if it exists (this is default behavour when insert
+		setting is clear).
 
 	Returns 0 on failure; 1 on success.
 */
@@ -638,9 +702,9 @@ static int vfd_set_ins_strip( struct sriov_port_s *port, struct vf_s *vf ) {
 			tx_vlan_insert_set_on_vf( port->rte_port_number, vf->num, 0 );					// no strip, so no insert
 		}
 	} else {
-		bleat_printf( 2, "%s vf: %d vlan list contains %d entries; strip/insert turned off", port->name, vf->num, vf->num_vlans );
-		rx_vlan_strip_set_on_vf(port->rte_port_number, vf->num, 0 );					// if more than one vlan in the list force strip to be off
-		tx_vlan_insert_set_on_vf( port->rte_port_number, vf->num, 0 );					// and set insert to id 0
+		bleat_printf( 2, "%s vf: %d vlan list contains %d entries; strip set to %d; insert turned off", port->name, vf->num, vf->num_vlans, vf->strip_stag );
+		rx_vlan_strip_set_on_vf( port->rte_port_number, vf->num, vf->strip_stag );		// strip is variable
+		tx_vlan_insert_set_on_vf( port->rte_port_number, vf->num, 0 );					// but insert must always be clear so that packet descriptor is used
 	}
 
 	return 1;
@@ -688,14 +752,21 @@ extern int vfd_update_nic( parms_t* parms, sriov_conf_t* conf ) {
 		port = &conf->ports[i];
 
 		if( parms->forreal ) {
-			tx_set_loopback( i, !!(port->flags & PF_LOOPBACK) );		// enable loopback if set (disabled: all vm-vm traffic must go to TOR and back
-			set_queue_drop( i, 1 );										// enable packet dropping if no descriptor matches
+			tx_set_loopback( port->rte_port_number, !!(port->flags & PF_LOOPBACK) );		// enable loopback if set (disabled: all vm-vm traffic must go to TOR and back
+
+			// do NOT call set_queue_drop() as it causes packetloss; drop enable handled by callback process now
+
+			disable_default_pool( port->rte_port_number );
 		}
 
 		if( port->last_updated == ADDED ) {								// updated since last call, reconfigure
 			if( parms->forreal ) {
 				bleat_printf( 1, "port updated: %s/%s",  port->name, port->pciid );
-				rte_eth_promiscuous_enable(port->rte_port_number);
+
+				if( port->flags & PF_PROMISC ) {
+					bleat_printf( 1, "enabling promiscuous mode for port %d", port->rte_port_number );
+					rte_eth_promiscuous_enable(port->rte_port_number);
+				}
 				rte_eth_allmulticast_enable(port->rte_port_number);
 	
 				ret = rte_eth_dev_uc_all_hash_table_set(port->rte_port_number, on);
@@ -732,7 +803,7 @@ extern int vfd_update_nic( parms_t* parms, sriov_conf_t* conf ) {
 					case RESET:		reason = "reset"; break;
 					default:		reason = "unknown reason"; break;
 				}
-				bleat_printf( 1, "reconfigure vf for %s: %s vf=%d", reason, port->pciid, vf->num );
+				bleat_printf( 1, "reconfigure vf for %s port: %d vf=%d", reason, port->rte_port_number, vf->num );
 
 				// TODO: order from original kept; probably can group into to blocks based on updated flag
 				if( vf->last_updated == DELETED ) { 							// delete vlans, free any buffers
@@ -747,35 +818,40 @@ extern int vfd_update_nic( parms_t* parms, sriov_conf_t* conf ) {
 
 					for(v = 0; v < vf->num_vlans; ++v) {
 						int vlan = vf->vlans[v];
-						bleat_printf( 2, "delete vlan: %s vf=%d vlan=%d", port->pciid, vf->num, vlan );
+						bleat_printf( 2, "delete vlan: port: %d vf: %d vlan: %d", port->rte_port_number, vf->num, vlan );
 						if( parms->forreal )
-							set_vf_rx_vlan(port->rte_port_number, vlan, vf_mask, 0);		// remove the vlan id from the list
+							set_vf_rx_vlan(port->rte_port_number, vlan, vf_mask, SET_OFF );		// remove the vlan id from the list
 					}
 				} else {
 					int v;
 					for(v = 0; v < vf->num_vlans; ++v) {
 						int vlan = vf->vlans[v];
-						bleat_printf( 2, "add vlan: %s vf=%d vlan=%d", port->pciid, vf->num, vlan );
+						bleat_printf( 2, "add vlan: port: %d vf=%d vlan=%d", port->rte_port_number, vf->num, vlan );
 						if( parms->forreal )
 							set_vf_rx_vlan(port->rte_port_number, vlan, vf_mask, on );		// add the vlan id to the list
 					}
 				}
 
 				if( vf->last_updated == DELETED ) {				// delete the macs
-					for(m = 0; m < vf->num_macs; ++m) {
+					for( m = vf->first_mac; m <= vf->num_macs; ++m ) {
 						mac = vf->macs[m];
-						bleat_printf( 2, "delete mac: %s vf=%d mac=%s", port->pciid, vf->num, mac );
+						bleat_printf( 2, "delete mac: port: %d vf: %d mac: %s", port->rte_port_number, vf->num, mac );
 		
 						if( parms->forreal )
-							set_vf_rx_mac(port->rte_port_number, mac, vf->num, 0);
+							set_vf_rx_mac(port->rte_port_number, mac, vf->num, SET_OFF );
 					}
 				} else {
-					for(m = 0; m < vf->num_macs; ++m) {
+					for( m = vf->first_mac; m <= vf->num_macs; ++m ) {			// if guest pushed a default, first will be [0], else first is [1]
 						mac = vf->macs[m];
-						bleat_printf( 2, "adding mac: %s vf=%d mac=%s", port->pciid, vf->num, mac );
+						bleat_printf( 2, "adding mac [%d]: port: %d vf: %d mac: %s", m, port->rte_port_number, vf->num, mac );
 
-						if( parms->forreal )
-							set_vf_rx_mac(port->rte_port_number, mac, vf->num, 1);
+						if( parms->forreal ) {
+							if( m > vf->first_mac ) {
+								set_vf_rx_mac( port->rte_port_number, mac, vf->num, SET_ON );	// set in whitelist
+							} else {
+								set_vf_default_mac( port->rte_port_number, mac, vf->num );		// first is set as default
+							}
+						}
 					}
 				}
 
@@ -791,27 +867,24 @@ extern int vfd_update_nic( parms_t* parms, sriov_conf_t* conf ) {
 
 				if( vf->num >= 0 ) {
 					if( parms->forreal ) {
-						// deprecated, now handeled by set queue drop function
-						//set_split_erop( i, y, 1 );				// allow drop of packets when there is no matching descriptor
-
-						bleat_printf( 2, "%s vf: %d set anti-spoof %d", port->name, vf->num, vf->vlan_anti_spoof );
+						bleat_printf( 2, "port: %d vf: %d set anti-spoof to %d", port->rte_port_number, vf->num, vf->vlan_anti_spoof );
 						set_vf_vlan_anti_spoofing(port->rte_port_number, vf->num, vf->vlan_anti_spoof);
 	
-						bleat_printf( 2, "%s vf: %d set mac-anti-spoof %d", port->name, vf->num, vf->mac_anti_spoof );
+						bleat_printf( 2, "port: %d vf: %d set mac-anti-spoof to %d", port->rte_port_number, vf->num, vf->mac_anti_spoof );
 						set_vf_mac_anti_spoofing(port->rte_port_number, vf->num, vf->mac_anti_spoof);
 	
 						vfd_set_ins_strip( port, vf );				// set insert/strip options
 
-						bleat_printf( 2, "%s vf: %d set allow broadcast %d", port->name, vf->num, vf->allow_bcast );
+						bleat_printf( 2, "port: %d vf: %d set allow broadcast to %d", port->rte_port_number, vf->num, vf->allow_bcast );
 						set_vf_allow_bcast(port->rte_port_number, vf->num, vf->allow_bcast);
 
-						bleat_printf( 2, "%s vf: %d set allow multicast %d", port->name, vf->num, vf->allow_mcast );
+						bleat_printf( 2, "port: %d vf: %d set allow multicast to %d", port->rte_port_number, vf->num, vf->allow_mcast );
 						set_vf_allow_mcast(port->rte_port_number, vf->num, vf->allow_mcast);
 
-						bleat_printf( 2, "%s vf: %d set allow un-ucast %d", port->name, vf->num, vf->allow_un_ucast );
+						bleat_printf( 2, "port: %d vf: %d set allow un-ucast to %d", port->rte_port_number, vf->num, vf->allow_un_ucast );
 						set_vf_allow_un_ucast(port->rte_port_number, vf->num, vf->allow_un_ucast);
 					} else {
-						bleat_printf( 1, "update vf skipping setup for spoofing, bcast, mcast, etc; forreal is off: %s vf=%d", port->pciid, vf->num );
+						bleat_printf( 1, "update vf skipping setup for spoofing, bcast, mcast, etc; forreal is off: %d vf=%d", port->rte_port_number, vf->num );
 					}
 				}
 
@@ -825,7 +898,7 @@ extern int vfd_update_nic( parms_t* parms, sriov_conf_t* conf ) {
 				//qos_set_credits( port->rte_port_number, port->mtu, pp, TC_4PERQ_MODE );	// push out to nic
 			}
 
-			if( vf->num >= 0 ) {
+			if( change2port && vf->num >= 0 ) {
 				if( parms->forreal ) {
 					bleat_printf( 3, "set promiscuous: port: %d, vf: %d ", port->rte_port_number, vf->num);
 					uint16_t rx_mode = 0;
@@ -833,7 +906,10 @@ extern int vfd_update_nic( parms_t* parms, sriov_conf_t* conf ) {
 			
 					// az says: figure out if we have to update it every time we change VLANS/MACS
 					// 			or once when update ports config
-					rte_eth_promiscuous_enable(port->rte_port_number);
+					if( port->flags & PF_PROMISC ) {
+						bleat_printf( 1, "enabling promiscuous mode for port %d", port->rte_port_number );
+						rte_eth_promiscuous_enable(port->rte_port_number);
+					}
 					rte_eth_allmulticast_enable(port->rte_port_number);
 					ret = rte_eth_dev_uc_all_hash_table_set(port->rte_port_number, on);
 			
@@ -845,7 +921,7 @@ extern int vfd_update_nic( parms_t* parms, sriov_conf_t* conf ) {
 					if (ret < 0)
 						bleat_printf( 3, "set_vf_allow_untagged(): bad VF receive mode parameter, return code = %d", ret);
 				} else {
-					bleat_printf( 1, "skipped end round updates to port: %s", port->pciid );
+					bleat_printf( 1, "skipped end round updates to port: %d", port->rte_port_number );
 				}
 			}
 		}				// end for each vf on this port
@@ -881,7 +957,6 @@ static void sig_int( int sig ) {
 	if( terminated ) {					// ignore concurrent signals
 		return;
 	}
-	terminated = 1;
 
 	switch( sig ) {
 		case SIGABRT:
@@ -889,11 +964,19 @@ static void sig_int( int sig ) {
 		case SIGSEGV:
 				bleat_printf( 0, "signal caught (aborting): %d", sig );
 				close_ports();				// must attempt to do this else we potentially crash the machine
-				abort( );
+				abort( );					// to get core; not safe to just set term flag and end normally
+				break;
+
+		case SIGUSR1:						// for these we just ignore and go on
+		case SIGUSR2:
+		case SIGALRM:
+				bleat_printf( 0, "signal caught (ignored): %d", sig );
 				break;
 
 		default:
+				terminated = 1;
 				bleat_printf( 0, "signal caught (terminating): %d", sig );
+				break;
 	}
 
 	return;
@@ -917,7 +1000,7 @@ static void set_signals( void ) {
 	struct sigaction sa;
 	int	sig_list[] = { SIGQUIT, SIGILL, SIGABRT, SIGFPE, SIGSEGV, SIGPIPE,				// list of signals we trap
        				SIGALRM, SIGTERM, SIGUSR1 , SIGUSR2, SIGBUS, SIGPROF, SIGSYS,
-					SIGTRAP, SIGURG, SIGVTALRM, SIGXCPU, SIGXFSZ, SIGIO, SIGWINCH };
+					SIGTRAP, SIGURG, SIGVTALRM, SIGXCPU, SIGXFSZ, SIGIO };
 
 	int i;
 	int nele;		// number of elements in the list
@@ -973,13 +1056,17 @@ timeDelta(struct timeval * now, struct timeval * before)
 	that has been set on the VF since it's only working off of the values that are
 	configured here.  Is there a reset all? for these?  If so, that should be worked into
 	the update_nic() funciton for an add, and probably for the delete too.
+
+	This function may also be called in an extreme event when all active VFs on the port
+	must be refreshed.  If vf_id passed in is < 0, then we reset all of the VFs that 
+	we are currently managing.
 */
 void
 restore_vf_setings(uint8_t port_id, int vf_id) {
 	int i;
 	int matched = 0;		// number matched for log
 
-	if( bleat_will_it( 2 ) ) {
+	if( bleat_will_it( 5 ) ) {
 		dump_sriov_config(running_config);
 	}
 
@@ -993,7 +1080,7 @@ restore_vf_setings(uint8_t port_id, int vf_id) {
 			for(y = 0; y < port->num_vfs; ++y){
 				struct vf_s *vf = &port->vfs[y];
 
-				if(vf_id == vf->num){
+				if( (vf_id < 0 && vf->num >= 0) || (vf_id == vf->num) ){
 					//uint32_t vf_mask = VFN2MASK(vf->num);
 
 					matched++;															// for bleat message at end
@@ -1082,17 +1169,20 @@ main(int argc, char **argv)
 	int		fd = -1;
 	int		enable_qos = 0;				// off by default enable_qos in config should be used to set on
 	int		state;
-
+	int 	j;
+	int		enable_fc = 0;				// enable flow control (-F sets)
 
   const char * main_help =
 		"\n"
-		"Usage: vfd [-f] [-n] [-p parm-file] [-v level] [-q]\n"
+		"Usage: vfd [-f] [-F] [-n] [-p parm-file] [-v level] [-q]\n"
 		"Usage: vfd -?\n"
 		"  Options:\n"
 		"\t -f        keep in 'foreground'\n"
+		"\t -F        enable flow control (might be ignored in qos mode)\n"
 		"\t -n        no-nic actions executed\n"
 		"\t -p <file> parmm file (/etc/vfd/vfd.cfg)\n"
 		"\t -q        enable dcb qos (use config file parm as general rule)\n"
+
 		"\t -h|?  Display this help screen\n"
 		"\n";
 
@@ -1106,10 +1196,14 @@ main(int argc, char **argv)
 	log_file = (char *) malloc( sizeof( char ) * BUF_1K );
 
   // Parse command line options
-  while ( (opt = getopt(argc, argv, "?qfhnqv:p:s:")) != -1)
+  while ( (opt = getopt(argc, argv, "?qfFhnqv:p:s:")) != -1)
   {
     switch (opt)
     {
+		case 'F':
+			enable_fc = 1;					// enable flow control (qos might ignore this)
+			break;
+			
 		case 'f':
 			run_asynch = 0;
 			break;
@@ -1135,6 +1229,7 @@ main(int argc, char **argv)
 		case 'h':
 		case '?':
 			printf( "\nVFd %s\n", version );
+			printf( "(17406)\n" );
 			printf("%s\n", main_help);
 			exit( 0 );
 			break;
@@ -1156,6 +1251,11 @@ main(int argc, char **argv)
 	if( enable_qos ) {							// command line flag overrides the config to force qos on
 		g_parms->rflags |= RF_ENABLE_QOS;
 	}
+
+	if( enable_fc ) {
+		g_parms->rflags |= RF_ENABLE_FC;
+	}
+
 	g_parms->forreal = forreal;
 
 	if( (running_config = (sriov_conf_t *) malloc( sizeof( *running_config ) )) == NULL ) {
@@ -1262,11 +1362,15 @@ main(int argc, char **argv)
 			}
 
 			if( pfidx >= 0 ) {														// initialise only if in our confilg file list (we may not manage everything)
+				for( j = 0; j < 64; j++ ) {
+					set_split_erop( portid, j, SET_ON );							// set the split receive drop enable for all VFs
+				}
+
 				if( g_parms->rflags & RF_ENABLE_QOS ) {
-					//state = dcb_port_init(portid, mbuf_pool);
 					state = dcb_port_init( &running_config->ports[pfidx], mbuf_pool );
 				} else {
-					state = port_init(portid, mbuf_pool);
+					state = port_init(portid, mbuf_pool, g_parms->pciids[portid].hw_strip_crc, &running_config->ports[pfidx] );
+					set_fc_on( portid, !!(g_parms->rflags & RF_ENABLE_FC) );		// if override is set, then force our setting for fc onto nic
 				}
 
 				if( state != 0 ) {
@@ -1275,6 +1379,8 @@ main(int argc, char **argv)
 				} else {
 					bleat_printf( 2, "port initialisation successful for port %d [%d]", portid, pfidx );
 				}
+
+				set_pfrx_drop( portid, 1 );			// enable the drop bit for the PF queues on this port
 			
 				rte_eth_macaddr_get(portid, &addr);
 				bleat_printf( 1,  "mapping port: %u, MAC: %02" PRIx8 ":%02" PRIx8 ":%02" PRIx8 ":%02" PRIx8 ":%02" PRIx8 ":%02" PRIx8 ", ",
@@ -1323,7 +1429,6 @@ main(int argc, char **argv)
 			exit( 1 );
 		}
 	}
-
 	
 	run_start_cbs( running_config );				// run any user startup callback commands defined in VF configs
 

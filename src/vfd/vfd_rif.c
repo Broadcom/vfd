@@ -10,6 +10,9 @@
 	Mods:		29 Nov 2016 : Add queue share support from vf config.
 				06 Jan 2017 : Incorporate DJ's fix for link mode.
 				30 Jan 2017 : Fix vfid check to detect pars error.
+				14 Feb 2017 : Correct bug in del range check on vf number.
+				21 Feb 2017 : Prevent empty vlan id list from being accepted.
+				23 Mar 2017 : Allow multiple VLAN IDs when strip == true.
 */
 
 
@@ -246,11 +249,14 @@ extern void vfd_add_ports( parms_t* parms, sriov_conf_t* conf ) {
 
 		port = &conf->ports[pidx];
 		port->flags = 0;
-		port->last_updated = ADDED;												// flag newly added so the nic is configured next go round
-		snprintf( port->name, sizeof( port->name ), "port-%d",  i);				// TODO--- support getting a name from the config
+		port->last_updated = ADDED;						 						// flag newly added so the nic is configured next go round
+		snprintf( port->name, sizeof( port->name ), "port_%d",  i);				// TODO--- support getting a name from the config
 		snprintf( port->pciid, sizeof( port->pciid ), "%s", pfc->id );
 		port->mtu = pfc->mtu;
 
+		if( pfc->flags & PFF_PROMISC ) {
+			port->flags |= PF_PROMISC;											// set promisc mode on the PF
+		}
 		if( pfc->flags & PFF_LOOP_BACK ) {
 			port->flags |= PF_LOOPBACK;											// enable VM->VM traffic without leaving nic
 		}
@@ -449,8 +455,8 @@ extern int vfd_add_vf( sriov_conf_t* conf, char* fname, char** reason ) {
 	}
 
 
-	if( vfc->nmacs > MAX_VF_MACS ) {
-		snprintf( mbuf, sizeof( mbuf ), "number of macs supplied (%d) exceeds the maximum (%d)", vfc->nmacs, MAX_VF_MACS );
+	if( vfc->nmacs > MAX_VF_MACS-1 ) {						// reduced by one so that the guest can push one down as the default mac
+		snprintf( mbuf, sizeof( mbuf ), "number of macs supplied (%d) exceeds the maximum (%d)", vfc->nmacs, MAX_VF_MACS-1 );
 		bleat_printf( 1, "vf not added: %s", mbuf );
 		if( reason ) {
 			*reason = strdup( mbuf );
@@ -459,8 +465,23 @@ extern int vfd_add_vf( sriov_conf_t* conf, char* fname, char** reason ) {
 		return 0;
 	}
 
+	/*
+	We now allow multiple VLAN IDs when stripping.  Strip is set (1) and insert is cleared (0) which 
+	causes strip on Rx and the tag indicated in the packet descriptor to be inserted on Tx.
+
 	if( vfc->strip_stag  &&  vfc->nvlans > 1 ) {		// one vlan is allowed when stripping
 		snprintf( mbuf, sizeof( mbuf ), "conflicting options: strip_stag may not be supplied with a list of vlan ids" );
+		bleat_printf( 1, "vf not added: %s", mbuf );
+		if( reason ) {
+			*reason = strdup( mbuf );
+		}
+		free_config( vfc );
+		return 0;
+	}
+	*/
+
+	if( vfc->nvlans <= 0 ) {							// must have at least one VLAN defined or bad things happen on the NIC
+		snprintf( mbuf, sizeof( mbuf ), "vlan id list may not be empty" );
 		bleat_printf( 1, "vf not added: %s", mbuf );
 		if( reason ) {
 			*reason = strdup( mbuf );
@@ -632,10 +653,11 @@ extern int vfd_add_vf( sriov_conf_t* conf, char* fname, char** reason ) {
 	}
 	vf->num_vlans = vfc->nvlans;
 
-	for( i = 0; i < vfc->nmacs; i++ ) {
-		strcpy( vf->macs[i], vfc->macs[i] );		// we vet for length earlier, so this is safe.
+	for( i = 1; i <= vfc->nmacs; i++ ) {				// src is 0 based but vf list is 1 based to allow for easy push if guests sets a default mac
+		strcpy( vf->macs[i], vfc->macs[i-1] );			// length vetted earlier, so this is safe
 	}
 	vf->num_macs = vfc->nmacs;
+	vf->first_mac = 1;								// if guests pushes a mac, we'll add it to [0] and reset the index
 
 	for( i = 0; i < MAX_TCS; i++ ) {				// copy in the VF's share of each traffic class (percentage)
 		vf->qshares[i] = vfc->qshare[i];
@@ -746,7 +768,7 @@ extern int vfd_del_vf( parms_t* parms, sriov_conf_t* conf, char* fname, char** r
 	bleat_printf( 2, "del: config data: pciid: %s", vfc->pciid );
 	bleat_printf( 2, "del: config data: vfid: %d", vfc->vfid );
 
-	if( vfc->pciid == NULL || vfc->vfid < 1 ) {
+	if( vfc->pciid == NULL || vfc->vfid < 0 ) {
 		snprintf( mbuf, sizeof( mbuf ), "unable to read config file: %s", fname );
 		bleat_printf( 1, "vfd_del_vf failed: %s", mbuf );
 		if( reason ) {
@@ -1081,7 +1103,7 @@ extern int vfd_req_if( parms_t *parms, sriov_conf_t* conf, int forever ) {
 						vfd_response( req->resp_fifo, 1, mbuf );
 						free( reason );
 					}
-					if( bleat_will_it( 3 ) ) {					// TODO:  remove after testing
+					if( bleat_will_it( 4 ) ) {					// TODO:  remove after testing
   						dump_sriov_config( conf );
 					}
 					break;
@@ -1105,7 +1127,7 @@ extern int vfd_req_if( parms_t *parms, sriov_conf_t* conf, int forever ) {
 						vfd_response( req->resp_fifo, 1, mbuf );
 						free( reason );
 					}
-					if( bleat_will_it( 3 ) ) {					// TODO:  remove after testing
+					if( bleat_will_it( 4 ) ) {					// TODO:  remove after testing
   						dump_sriov_config( conf );
 					}
 					break;

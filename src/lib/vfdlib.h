@@ -11,6 +11,11 @@
 	Things that need to be visible to vfd
 */
 
+// ----- jw_xapi --------------------------
+#define JWFMT_HEX		1
+#define JWFMT_INT		2
+#define JWFMT_FLOAT		3
+
 //----------------- config.c --------------------------------------------------------------------------
                                     // tc_class_t struct flags
 #define TCF_LOW_LATENCY 0x01
@@ -19,10 +24,12 @@
 									// pfdef_t struct flags
 #define PFF_LOOP_BACK	0x01		// loop back enabled flag
 #define PFF_VF_OVERSUB  0x02        // vf_oversubscription enabled flag
+#define PFF_PROMISC  	0x04        // promisc should be set for the PF
 
 									// flags set in parm struct related to running state
 #define RF_ENABLE_QOS	0x01		// enable qos
 #define RF_INITIALISED	0x02		// init has finished
+#define RF_ENABLE_FC	0x04		// enable flow control for all PFs
 
 #define MAX_TCS			8			// max number of traffic classes supported (0 - 7)
 #define NUM_BWGS		8			// number of bandwidth groups
@@ -51,6 +58,7 @@ typedef struct {
 typedef struct {
 	char*	id;
 	int		mtu;
+	int		hw_strip_crc;			// set hardware to strip crc when true
 	unsigned int flags;				// PFF_ flag constants
 									// QoS members
     int32_t ntcs;					// number of TCs (4 or 8)
@@ -139,6 +147,7 @@ void ng_flow_ref( void *vf, char *buf, long len );
 extern void* rfifo_create( char* fname, int mode );
 extern void rfifo_close( void* vfifo );
 extern char* rfifo_read( void* vfifo );
+extern char* rfifo_readln( void* vfifo );
 
 
 // --------------- list ----------------------------------------------------------------------------------
@@ -180,4 +189,12 @@ extern char* jw_string_ele( void* st, const char* name, int idx );
 extern float jw_value_ele( void* st, const char* name, int idx );
 extern void* jw_obj_ele( void* st, const char* name, int idx );
 extern int jw_array_len( void* st, const char* name );
+
+// ---------------- jw_xapi ---------------------------------------------------------------------------------
+extern int get_bool( void* jblob, char const* field_name, int def_value );
+extern float get_value( void* jblob, char const* field_name, float def_value );
+extern int get_ivalue( void* jblob, char const* field_name, int def_value );
+extern char* get_value_as_str( void* jblob, char const* field_name, char const* def_value, int  fmt );
+extern char* get_str( void* jblob, char const* field_name, char const* def_value );
+
 #endif
